@@ -1,6 +1,6 @@
 # Base MaxMind et données locales
-data/
-*.mmdb
+#data/
+#*.mmdb
 
 # Fichiers Python
 __pycache__/
