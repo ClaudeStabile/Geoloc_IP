@@ -176,14 +176,16 @@ def watch_log_file(filename):
       continue
 
     target = extract_target(line, source)
-    geo_data["source"] = source
-    geo_data["target"] = target or "—"
 
     with state_lock:
       ip_counts[ip] += 1
       source_counts[source] += 1
       if target:
         target_counts[target] += 1
+
+      geo_data["source"] = source
+      geo_data["target"] = target or "—"
+      geo_data["ip_count"] = ip_counts[ip]
 
       payload = {
           "marker": geo_data,
