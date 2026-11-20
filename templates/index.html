@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <title>Live IP Geolocation Tracker</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="" />
+    <style>
+        html, body {
+            height: 100%;
+            margin: 0;
+            padding: 0;
+            font-family: system-ui, -apple-system, sans-serif;
+            background-color: #14171a;
+        }
+        #map {
+            height: 100%;
+            width: 100%;
+        }
+        #info-panel {
+            position: absolute;
+            top: 12px;
+            right: 12px;
+            width: 340px;
+            max-height: calc(100% - 24px);
+            overflow-y: auto;
+            background: rgba(20, 23, 26, 0.92);
+            color: #f1f3f5;
+            padding: 14px 16px;
+            box-shadow: 0 4px 16px rgba(0, 0, 0, 0.45);
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            border-radius: 8px;
+            z-index: 1000;
+            font-size: 13px;
+        }
+        #urls-panel {
+            position: absolute;
+            bottom: 12px;
+            left: 12px;
+            width: 380px;
+            max-width: calc(100% - 24px);
+            background: rgba(20, 23, 26, 0.92);
+            color: #f1f3f5;
+            padding: 12px 16px;
+            box-shadow: 0 4px 16px rgba(0, 0, 0, 0.45);
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            border-radius: 8px;
+            z-index: 1000;
+            font-size: 13px;
+        }
+        .total-box {
+            font-size: 15px;
+            margin-bottom: 12px;
+            padding-bottom: 10px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.12);
+        }
+        h3 {
+            margin: 0 0 8px 0;
+            font-size: 13px;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: #adb5bd;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        th, td {
+            text-align: left;
+            padding: 5px 4px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+            vertical-align: top;
+        }
+        th {
+            color: #868e96;
+            font-weight: 600;
+            font-size: 11px;
+        }
+        .ip-cell {
+            font-family: monospace;
+            color: #74c0fc;
+        }
+        .host-cell {
+            color: #ced4da;
+            font-size: 11px;
+            word-break: break-all;
+        }
+        .url-cell {
+            font-family: monospace;
+            color: #69db7c;
+            font-size: 12px;
+            word-break: break-all;
+        }
+        .count-cell {
+            text-align: right;
+            font-weight: 700;
+            color: #ff8787;
+            white-space: nowrap;
+            padding-left: 8px;
+        }
+    </style>
+</head>
+<body>
+    <div id="info-panel">
+        <div class="total-box">
+            <b>Connexions en direct :</b> <span id="count">0</span>
+        </div>
+        <h3>Top 10 IP connectées</h3>
+        <table>
+            <thead>
+                <tr>
+                    <th>IP / Hôte</th>
+                    <th style="text-align: right;">Hits</th>
+                </tr>
+            </thead>
+            <tbody id="top-ips-body">
+                <tr><td colspan="2" style="color:#868e96;">En attente de trafic...</td></tr>
+            </tbody>
+        </table>
+    </div>
+
+    <div id="urls-panel">
+        <h3>Top 5 URL actives</h3>
+        <table>
+            <thead>
+                <tr>
+                    <th>URL</th>
+                    <th style="text-align: right;">Connexions</th>
+                </tr>
+            </thead>
+            <tbody id="top-urls-body">
+                <tr><td colspan="2" style="color:#868e96;">En attente de trafic...</td></tr>
+            </tbody>
+        </table>
+    </div>
+
+    <div id="map"></div>
+
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
+    <script>
+        const map = L.map("map", { worldCopyJump: true }).setView([20, 0], 2);
+
+        L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+            maxZoom: 19,
+            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+        }).addTo(map);
+
+        const markers = [];
+        let totalCount = 0;
+
+        function escapeHtml(str) {
+            return String(str)
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/"/g, "&quot;");
+        }
+
+        function addMarker(data) {
+            totalCount++;
+            document.getElementById("count").innerText = totalCount;
+
+            const marker = L.circleMarker([data.lat, data.lon], {
+                radius: 6,
+                color: "#ff4d4f",
+                weight: 2,
+                fillColor: "#ff7875",
+                fillOpacity: 0.8
+            }).addTo(map);
+
+            marker.bindPopup(
+                `<b>IP :</b> ${escapeHtml(data.ip)}<br>` +
+                `<b>Hôte :</b> ${escapeHtml(data.hostname)}<br>` +
+                `<b>Lieu :</b> ${escapeHtml(data.city)}, ${escapeHtml(data.country)}`
+            );
+
+            markers.push(marker);
+            if (markers.length > 50) {
+                const oldMarker = markers.shift();
+                map.removeLayer(oldMarker);
+            }
+        }
+
+        function renderTopIps(topIps) {
+            const tbody = document.getElementById("top-ips-body");
+            if (!topIps || topIps.length === 0) return;
+
+            tbody.innerHTML = topIps.map(item => `
+                <tr>
+                    <td>
+                        <div class="ip-cell">${escapeHtml(item.ip)}</div>
+                        <div class="host-cell">${escapeHtml(item.hostname)}</div>
+                    </td>
+                    <td class="count-cell">${item.count}</td>
+                </tr>
+            `).join("");
+        }
+
+        function renderTopUrls(topUrls) {
+            const tbody = document.getElementById("top-urls-body");
+            if (!topUrls || topUrls.length === 0) return;
+
+            tbody.innerHTML = topUrls.map(item => `
+                <tr>
+                    <td class="url-cell">${escapeHtml(item.url)}</td>
+                    <td class="count-cell">${item.count}</td>
+                </tr>
+            `).join("");
+        }
+
+        const evtSource = new EventSource("/stream");
+        evtSource.onmessage = function(event) {
+            const payload = JSON.parse(event.data);
+            if (payload.marker) {
+                addMarker(payload.marker);
+            }
+            if (payload.top_ips) {
+                renderTopIps(payload.top_ips);
+            }
+            if (payload.top_urls) {
+                renderTopUrls(payload.top_urls);
+            }
+        };
+    </script>
+</body>
+</html>

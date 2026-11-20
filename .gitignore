@@ -1,0 +1,17 @@
+# Base MaxMind et données locales
+data/
+*.mmdb
+
+# Fichiers Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+
+# Fichiers système et éditeurs
+.DS_Store
+Thumbs.db
+.env
+*.log
