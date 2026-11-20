@@ -6,12 +6,14 @@ services:
     container_name: ip-geo-tracker
     restart: unless-stopped
     ports:
-      - "5000:5000"
+      - "127.0.0.1:5000:5000"
     volumes:
-      # Volume pour vos logs serveur (lecture seule)
-      - /var/log/nginx:/logs:ro
-      # Volume pour la base de données MaxMind locale (lecture seule)
+      # Nginx logs directory (read-only)
+      - /var/log/nginx:/logs/nginx:ro
+      # HAProxy single log file (read-only)
+      - /var/log/haproxy.log:/logs/haproxy.log:ro
+      # MaxMind GeoLite2 database (read-only)
       - ./data:/data:ro
     environment:
-      - LOG_FILE=/logs/access.log
+      - LOG_FILES=/logs/nginx/access.log,/logs/haproxy.log
       - GEOIP_DB_PATH=data/GeoLite2-City_20261113/GeoLite2-City.mmdb
