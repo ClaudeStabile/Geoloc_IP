@@ -17,3 +17,4 @@ services:
     environment:
       - LOG_FILES=/logs/nginx/access.log,/logs/haproxy.log
       - GEOIP_DB_PATH=data/GeoLite2-City_20261113/GeoLite2-City.mmdb
+      - WINDOW_SECONDS=3600

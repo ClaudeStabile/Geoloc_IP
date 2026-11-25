@@ -1,4 +1,4 @@
-from collections import Counter
+from collections import Counter, deque
 import json
 import os
 import queue
@@ -6,7 +6,7 @@ import re
 import socket
 import threading
 import time
-from flask import Flask, Response, render_template
+from flask import Flask, Response, jsonify, render_template, request
 import geoip2.database
 
 app = Flask(__name__)
@@ -18,6 +18,9 @@ raw_log_files = (
 )
 LOG_FILES = [p.strip() for p in raw_log_files.split(",") if p.strip()]
 GEOIP_DB_PATH = os.getenv("GEOIP_DB_PATH", "/data/GeoLite2-City.mmdb")
+
+# Rolling window in seconds (default: 3600 = 1 hour)
+DEFAULT_WINDOW_SECONDS = max(10, int(os.getenv("WINDOW_SECONDS", "3600")))
 
 # Match IPv4 at start of Nginx line OR after "haproxy[pid]: " (with optional :port)
 NGINX_IP_REGEX = re.compile(r"^(\d{1,3}(?:\.\d{1,3}){3})\b")
@@ -48,7 +51,8 @@ try:
 except Exception as e:
   print(f"Erreur lors du chargement de la base GeoIP: {e}")
 
-ip_counts = Counter()
+window_seconds = DEFAULT_WINDOW_SECONDS
+ip_timestamps = {}  # ip -> deque of epoch timestamps (combined Nginx + HAProxy)
 target_counts = Counter()
 source_counts = Counter()
 hostname_cache = {}
@@ -120,14 +124,39 @@ def get_geoip(ip):
   return None
 
 
-def build_top_ips(limit=10):
+def prune_and_count_ips(now=None):
+  """Prunes timestamps outside the rolling window and returns active hit counts per IP."""
+  if now is None:
+    now = time.time()
+  cutoff = now - window_seconds
+  active_counts = {}
+  empty_ips = []
+
+  for ip, dq in ip_timestamps.items():
+    while dq and dq[0] < cutoff:
+      dq.popleft()
+    if dq:
+      active_counts[ip] = len(dq)
+    else:
+      empty_ips.append(ip)
+
+  for ip in empty_ips:
+    del ip_timestamps[ip]
+
+  return active_counts
+
+
+def build_top_ips(limit=10, now=None):
+  """Returns the top N active IPs (Nginx + HAProxy combined) within the rolling window."""
+  active_counts = prune_and_count_ips(now)
+  ranked = sorted(active_counts.items(), key=lambda kv: kv[1], reverse=True)[:limit]
   return [
       {
           "ip": ip,
           "hostname": resolve_hostname(ip),
           "count": count,
       }
-      for ip, count in ip_counts.most_common(limit)
+      for ip, count in ranked
   ]
 
 
@@ -176,22 +205,28 @@ def watch_log_file(filename):
       continue
 
     target = extract_target(line, source)
+    now = time.time()
 
     with state_lock:
-      ip_counts[ip] += 1
+      dq = ip_timestamps.setdefault(ip, deque())
+      dq.append(now)
       source_counts[source] += 1
       if target:
         target_counts[target] += 1
 
+      top_ips = build_top_ips(10, now=now)
+      ip_window_count = len(ip_timestamps.get(ip, ()))
+
       geo_data["source"] = source
       geo_data["target"] = target or "—"
-      geo_data["ip_count"] = ip_counts[ip]
+      geo_data["ip_count"] = ip_window_count
 
       payload = {
           "marker": geo_data,
-          "top_ips": build_top_ips(10),
+          "top_ips": top_ips,
           "top_targets": build_top_targets(5),
           "sources": dict(source_counts),
+          "window_seconds": window_seconds,
       }
 
     try:
@@ -215,7 +250,36 @@ start_watchers()
 
 @app.route("/")
 def index():
-  return render_template("index.html")
+  return render_template("index.html", window_seconds=window_seconds)
+
+
+@app.route("/api/config", methods=["GET", "POST"])
+def api_config():
+  global window_seconds
+  if request.method == "POST":
+    data = request.get_json(silent=True) or {}
+    try:
+      new_window = int(data.get("window_seconds", window_seconds))
+      if 10 <= new_window <= 86400:
+        with state_lock:
+          window_seconds = new_window
+          top_ips = build_top_ips(10)
+        payload = {
+            "top_ips": top_ips,
+            "window_seconds": window_seconds,
+        }
+        try:
+          event_queue.put_nowait(json.dumps(payload))
+        except queue.Full:
+          pass
+        return jsonify({"ok": True, "window_seconds": window_seconds})
+    except (TypeError, ValueError):
+      pass
+    return jsonify({"ok": False, "error": "Invalid window_seconds (10..86400)"}), 400
+
+  with state_lock:
+    prune_and_count_ips()
+  return jsonify({"window_seconds": window_seconds})
 
 
 @app.route("/stream")
@@ -226,7 +290,11 @@ def stream():
         msg = event_queue.get(timeout=15)
         yield f"data: {msg}\n\n"
       except queue.Empty:
-        yield ": keep-alive\n\n"
+        # Periodically prune stale IPs so expired entries drop off even when traffic is quiet
+        with state_lock:
+          top_ips = build_top_ips(10)
+          current_window = window_seconds
+        yield f"data: {json.dumps({'top_ips': top_ips, 'window_seconds': current_window})}\n\n"
 
   return Response(event_stream(), mimetype="text/event-stream")
 
