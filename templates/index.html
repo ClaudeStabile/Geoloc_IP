@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="fr">
+<html lang="en">
 <head>
     <meta charset="UTF-8">
     <title>Live IP Geolocation Tracker (Nginx + HAProxy)</title>
@@ -20,7 +20,7 @@
             position: absolute;
             top: 12px;
             right: 12px;
-            width: 360px;
+            width: 365px;
             max-height: calc(100% - 24px);
             overflow-y: auto;
             background: rgba(20, 23, 26, 0.92);
@@ -65,7 +65,7 @@
             align-items: center;
             justify-content: space-between;
             gap: 8px;
-            margin-bottom: 12px;
+            margin-bottom: 10px;
             padding-bottom: 10px;
             border-bottom: 1px solid rgba(255, 255, 255, 0.12);
             font-size: 12px;
@@ -136,46 +136,56 @@
 <body>
     <div id="info-panel">
         <div class="total-box">
-            <b>Connexions en direct :</b> <span id="count">0</span>
+            <b>Active connections:</b> <span id="count">0</span>
         </div>
         <div class="sources-bar">
             <span><span class="dot-nginx">●</span> Nginx: <b id="src-nginx">0</b></span>
             <span><span class="dot-haproxy">●</span> HAProxy: <b id="src-haproxy">0</b></span>
         </div>
         <div class="window-row">
-            <label for="window-select"><b>Fenêtre Top 10 IP :</b></label>
-            <select id="window-select">
-                <option value="900">15 minutes</option>
-                <option value="3600" selected>1 heure</option>
-                <option value="21600">6 heures</option>
-                <option value="86400">24 heures</option>
+            <label for="ttl-select"><b>Active TTL:</b></label>
+            <select id="ttl-select">
+                <option value="15">15s</option>
+                <option value="30">30s</option>
+                <option value="60" selected>60s</option>
+                <option value="120">2m</option>
+                <option value="300">5m</option>
             </select>
         </div>
-        <h3>Top 10 IP (<span id="window-label">1h</span>)</h3>
+        <div class="window-row">
+            <label for="window-select"><b>Top 10 IP window:</b></label>
+            <select id="window-select">
+                <option value="900">15 minutes</option>
+                <option value="3600" selected>1 hour</option>
+                <option value="21600">6 hours</option>
+                <option value="86400">24 hours</option>
+            </select>
+        </div>
+        <h3>Top 10 IPs (<span id="window-label">1h</span>)</h3>
         <table>
             <thead>
                 <tr>
-                    <th>IP / Hôte</th>
+                    <th>IP / Host</th>
                     <th style="text-align: right;">Hits</th>
                 </tr>
             </thead>
             <tbody id="top-ips-body">
-                <tr><td colspan="2" style="color:#868e96;">En attente de trafic...</td></tr>
+                <tr><td colspan="2" style="color:#868e96;">Waiting for traffic...</td></tr>
             </tbody>
         </table>
     </div>
 
     <div id="urls-panel">
-        <h3>Top 5 URL / Backends actifs</h3>
+        <h3>Top 5 Active URLs / Backends</h3>
         <table>
             <thead>
                 <tr>
                     <th>URL (Nginx) / Backend (HAProxy)</th>
-                    <th style="text-align: right;">Connexions</th>
+                    <th style="text-align: right;">Connections</th>
                 </tr>
             </thead>
             <tbody id="top-targets-body">
-                <tr><td colspan="2" style="color:#868e96;">En attente de trafic...</td></tr>
+                <tr><td colspan="2" style="color:#868e96;">Waiting for traffic...</td></tr>
             </tbody>
         </table>
     </div>
@@ -194,9 +204,8 @@
         const BASE_RADIUS = 6;
         const MAX_SCALE_RATIO = 4;
 
-        const markers = [];
-        const markersByIp = new Map();
-        let totalCount = 0;
+        // One active marker per IP so expired IPs can be cleanly removed from the map
+        const activeMarkersByIp = new Map();
 
         function escapeHtml(str) {
             return String(str)
@@ -213,18 +222,16 @@
             return `${s}s`;
         }
 
-        function syncWindowSelect(sec) {
-            const select = document.getElementById("window-select");
-            const val = String(sec);
-            let opt = Array.from(select.options).find(o => o.value === val);
-            if (!opt) {
-                opt = document.createElement("option");
-                opt.value = val;
-                opt.textContent = formatWindowLabel(sec);
+        function ensureSelectValue(selectId, value) {
+            const select = document.getElementById(selectId);
+            const strVal = String(value);
+            if (!Array.from(select.options).some(o => o.value === strVal)) {
+                const opt = document.createElement("option");
+                opt.value = strVal;
+                opt.textContent = `${strVal}s`;
                 select.appendChild(opt);
             }
-            select.value = val;
-            document.getElementById("window-label").innerText = formatWindowLabel(sec);
+            select.value = strVal;
         }
 
         function computeRadius(ipCount) {
@@ -233,49 +240,61 @@
             return BASE_RADIUS * ratio;
         }
 
-        function addMarker(data) {
-            totalCount++;
-            document.getElementById("count").innerText = totalCount;
-
-            const isHaproxy = data.source === "haproxy";
-            const ipCount = data.ip_count || 1;
-            const radius = computeRadius(ipCount);
-
-            const existingForIp = markersByIp.get(data.ip) || [];
-            for (const oldM of existingForIp) {
-                oldM.setRadius(radius);
+        function syncActiveMarkers(activeMarkers, expiredIps) {
+            if (Array.isArray(expiredIps)) {
+                for (const ip of expiredIps) {
+                    const existing = activeMarkersByIp.get(ip);
+                    if (existing) {
+                        map.removeLayer(existing);
+                        activeMarkersByIp.delete(ip);
+                    }
+                }
             }
 
-            const marker = L.circleMarker([data.lat, data.lon], {
-                radius: radius,
-                color: isHaproxy ? "#2f9e44" : "#ff4d4f",
-                weight: 2,
-                fillColor: isHaproxy ? "#51cf66" : "#ff7875",
-                fillOpacity: 0.8
-            }).addTo(map);
+            if (!Array.isArray(activeMarkers)) return;
 
-            marker.bindPopup(
-                `<b>Source :</b> ${escapeHtml((data.source || "nginx").toUpperCase())}<br>` +
-                `<b>IP :</b> ${escapeHtml(data.ip)} (${ipCount} hits)<br>` +
-                `<b>Hôte :</b> ${escapeHtml(data.hostname)}<br>` +
-                `<b>Cible :</b> ${escapeHtml(data.target || "—")}<br>` +
-                `<b>Lieu :</b> ${escapeHtml(data.city)}, ${escapeHtml(data.country)}`
-            );
+            const currentIps = new Set(activeMarkers.map(m => m.ip));
+            for (const [ip, layer] of activeMarkersByIp.entries()) {
+                if (!currentIps.has(ip)) {
+                    map.removeLayer(layer);
+                    activeMarkersByIp.delete(ip);
+                }
+            }
 
-            existingForIp.push(marker);
-            markersByIp.set(data.ip, existingForIp);
-            markers.push(marker);
+            for (const data of activeMarkers) {
+                const isHaproxy = data.source === "haproxy";
+                const ipCount = data.ip_count || 1;
+                const radius = computeRadius(ipCount);
+                const popupHtml =
+                    `<b>Source:</b> ${escapeHtml((data.source || "nginx").toUpperCase())}<br>` +
+                    `<b>IP:</b> ${escapeHtml(data.ip)} (${ipCount} active hits)<br>` +
+                    `<b>Host:</b> ${escapeHtml(data.hostname)}<br>` +
+                    `<b>Target:</b> ${escapeHtml(data.target || "—")}<br>` +
+                    `<b>Location:</b> ${escapeHtml(data.city)}, ${escapeHtml(data.country)}`;
 
-            if (markers.length > 50) {
-                const oldMarker = markers.shift();
-                map.removeLayer(oldMarker);
+                let marker = activeMarkersByIp.get(data.ip);
+                if (marker) {
+                    marker.setLatLng([data.lat, data.lon]);
+                    marker.setRadius(radius);
+                    marker.setPopupContent(popupHtml);
+                } else {
+                    marker = L.circleMarker([data.lat, data.lon], {
+                        radius: radius,
+                        color: isHaproxy ? "#2f9e44" : "#ff4d4f",
+                        weight: 2,
+                        fillColor: isHaproxy ? "#51cf66" : "#ff7875",
+                        fillOpacity: 0.8
+                    }).addTo(map);
+                    marker.bindPopup(popupHtml);
+                    activeMarkersByIp.set(data.ip, marker);
+                }
             }
         }
 
         function renderTopIps(topIps) {
             const tbody = document.getElementById("top-ips-body");
             if (!topIps || topIps.length === 0) {
-                tbody.innerHTML = `<tr><td colspan="2" style="color:#868e96;">Aucune IP active sur la période</td></tr>`;
+                tbody.innerHTML = `<tr><td colspan="2" style="color:#868e96;">No active IPs in window</td></tr>`;
                 return;
             }
 
@@ -312,30 +331,46 @@
             document.getElementById("src-haproxy").innerText = sources.haproxy || 0;
         }
 
-        syncWindowSelect({{ window_seconds | default(3600) }});
-
-        document.getElementById("window-select").addEventListener("change", async function(e) {
-            const seconds = Number(e.target.value);
+        async function pushConfigUpdate() {
+            const seconds = Number(document.getElementById("window-select").value);
+            const ttl = Number(document.getElementById("ttl-select").value);
             const res = await fetch("/api/config", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ window_seconds: seconds })
+                body: JSON.stringify({
+                    window_seconds: seconds,
+                    active_ttl_seconds: ttl
+                })
             });
             if (res.ok) {
                 const data = await res.json();
-                syncWindowSelect(data.window_seconds);
+                ensureSelectValue("window-select", data.window_seconds);
+                ensureSelectValue("ttl-select", data.active_ttl_seconds);
+                document.getElementById("window-label").innerText = formatWindowLabel(data.window_seconds);
             }
-        });
+        }
+
+        ensureSelectValue("window-select", {{ window_seconds | default(3600) }});
+        ensureSelectValue("ttl-select", {{ active_ttl_seconds | default(60) }});
+        document.getElementById("window-label").innerText = formatWindowLabel({{ window_seconds | default(3600) }});
+
+        document.getElementById("window-select").addEventListener("change", pushConfigUpdate);
+        document.getElementById("ttl-select").addEventListener("change", pushConfigUpdate);
 
         const evtSource = new EventSource("/stream");
         evtSource.onmessage = function(event) {
             const payload = JSON.parse(event.data);
             if (payload.window_seconds) {
-                syncWindowSelect(payload.window_seconds);
+                ensureSelectValue("window-select", payload.window_seconds);
+                document.getElementById("window-label").innerText = formatWindowLabel(payload.window_seconds);
             }
-            if (payload.marker) {
-                addMarker(payload.marker);
+            if (payload.active_ttl_seconds) {
+                ensureSelectValue("ttl-select", payload.active_ttl_seconds);
             }
+            if (typeof payload.active_connections === "number") {
+                document.getElementById("count").innerText = payload.active_connections;
+            }
+            syncActiveMarkers(payload.active_markers, payload.expired_ips);
             if (payload.top_ips) {
                 renderTopIps(payload.top_ips);
             }

@@ -19,8 +19,11 @@ raw_log_files = (
 LOG_FILES = [p.strip() for p in raw_log_files.split(",") if p.strip()]
 GEOIP_DB_PATH = os.getenv("GEOIP_DB_PATH", "/data/GeoLite2-City.mmdb")
 
-# Rolling window in seconds (default: 3600 = 1 hour)
+# Rolling window for Top 10 IPs (default: 3600 = 1 hour)
 DEFAULT_WINDOW_SECONDS = max(10, int(os.getenv("WINDOW_SECONDS", "3600")))
+
+# Active connection TTL in seconds (default: 60s) — controls active count & live map markers
+DEFAULT_ACTIVE_TTL_SECONDS = max(5, int(os.getenv("ACTIVE_TTL_SECONDS", "60")))
 
 # Match IPv4 at start of Nginx line OR after "haproxy[pid]: " (with optional :port)
 NGINX_IP_REGEX = re.compile(r"^(\d{1,3}(?:\.\d{1,3}){3})\b")
@@ -52,7 +55,11 @@ except Exception as e:
   print(f"Erreur lors du chargement de la base GeoIP: {e}")
 
 window_seconds = DEFAULT_WINDOW_SECONDS
-ip_timestamps = {}  # ip -> deque of epoch timestamps (combined Nginx + HAProxy)
+active_ttl_seconds = DEFAULT_ACTIVE_TTL_SECONDS
+
+ip_timestamps = {}  # ip -> deque of epoch timestamps for Top 10 window
+active_ip_timestamps = {}  # ip -> deque of epoch timestamps for active TTL
+ip_geo_meta = {}  # ip -> latest geo/source/target metadata while active
 target_counts = Counter()
 source_counts = Counter()
 hostname_cache = {}
@@ -124,31 +131,30 @@ def get_geoip(ip):
   return None
 
 
-def prune_and_count_ips(now=None):
-  """Prunes timestamps outside the rolling window and returns active hit counts per IP."""
-  if now is None:
-    now = time.time()
-  cutoff = now - window_seconds
-  active_counts = {}
-  empty_ips = []
+def prune_deque_map(ts_map, max_age_seconds, now):
+  """Prunes timestamps older than now - max_age_seconds and returns active counts."""
+  cutoff = now - max_age_seconds
+  counts = {}
+  expired_keys = []
 
-  for ip, dq in ip_timestamps.items():
+  for key, dq in ts_map.items():
     while dq and dq[0] < cutoff:
       dq.popleft()
     if dq:
-      active_counts[ip] = len(dq)
+      counts[key] = len(dq)
     else:
-      empty_ips.append(ip)
+      expired_keys.append(key)
 
-  for ip in empty_ips:
-    del ip_timestamps[ip]
+  for key in expired_keys:
+    del ts_map[key]
 
-  return active_counts
+  return counts, expired_keys
 
 
 def build_top_ips(limit=10, now=None):
-  """Returns the top N active IPs (Nginx + HAProxy combined) within the rolling window."""
-  active_counts = prune_and_count_ips(now)
+  if now is None:
+    now = time.time()
+  active_counts, _ = prune_deque_map(ip_timestamps, window_seconds, now)
   ranked = sorted(active_counts.items(), key=lambda kv: kv[1], reverse=True)[:limit]
   return [
       {
@@ -170,6 +176,47 @@ def build_top_targets(limit=5):
   ]
 
 
+def build_active_snapshot(now=None):
+  """Returns current active connections, active markers, and expired IPs."""
+  if now is None:
+    now = time.time()
+  active_counts, expired_ips = prune_deque_map(
+      active_ip_timestamps, active_ttl_seconds, now
+  )
+  for ip in expired_ips:
+    ip_geo_meta.pop(ip, None)
+
+  markers = []
+  total_active_hits = 0
+  for ip, hit_count in active_counts.items():
+    total_active_hits += hit_count
+    meta = ip_geo_meta.get(ip)
+    if meta:
+      m = dict(meta)
+      m["ip_count"] = hit_count
+      markers.append(m)
+
+  return {
+      "active_connections": len(active_counts),
+      "active_hits": total_active_hits,
+      "active_markers": markers,
+      "expired_ips": expired_ips,
+      "active_ttl_seconds": active_ttl_seconds,
+  }
+
+
+def enqueue_payload(payload_dict):
+  raw = json.dumps(payload_dict)
+  try:
+    event_queue.put_nowait(raw)
+  except queue.Full:
+    try:
+      event_queue.get_nowait()
+      event_queue.put_nowait(raw)
+    except queue.Empty:
+      pass
+
+
 def watch_log_file(filename):
   """Continuously reads new lines from a single log file and pushes parsed events."""
   while not os.path.exists(filename):
@@ -183,7 +230,6 @@ def watch_log_file(filename):
   while True:
     line = f.readline()
     if not line:
-      # Detect log rotation (file truncated or replaced)
       try:
         current_size = os.stat(filename).st_size
         if current_size < f.tell():
@@ -208,41 +254,61 @@ def watch_log_file(filename):
     now = time.time()
 
     with state_lock:
-      dq = ip_timestamps.setdefault(ip, deque())
-      dq.append(now)
+      ip_timestamps.setdefault(ip, deque()).append(now)
+      active_ip_timestamps.setdefault(ip, deque()).append(now)
       source_counts[source] += 1
       if target:
         target_counts[target] += 1
 
-      top_ips = build_top_ips(10, now=now)
-      ip_window_count = len(ip_timestamps.get(ip, ()))
-
       geo_data["source"] = source
       geo_data["target"] = target or "—"
-      geo_data["ip_count"] = ip_window_count
+      ip_geo_meta[ip] = dict(geo_data)
+
+      snapshot = build_active_snapshot(now=now)
+      top_ips = build_top_ips(10, now=now)
 
       payload = {
-          "marker": geo_data,
+          **snapshot,
           "top_ips": top_ips,
           "top_targets": build_top_targets(5),
           "sources": dict(source_counts),
           "window_seconds": window_seconds,
       }
 
-    try:
-      event_queue.put_nowait(json.dumps(payload))
-    except queue.Full:
-      try:
-        event_queue.get_nowait()
-        event_queue.put_nowait(json.dumps(payload))
-      except queue.Empty:
-        pass
+    enqueue_payload(payload)
+
+
+def reaper_loop():
+  """Periodically prunes expired active connections so counts drop and markers vanish."""
+  last_signature = None
+  while True:
+    time.sleep(1)
+    now = time.time()
+    with state_lock:
+      snapshot = build_active_snapshot(now=now)
+      top_ips = build_top_ips(10, now=now)
+      sig = (
+          snapshot["active_connections"],
+          snapshot["active_hits"],
+          tuple(snapshot["expired_ips"]),
+          tuple((m["ip"], m["ip_count"]) for m in snapshot["active_markers"]),
+      )
+      if sig != last_signature:
+        last_signature = sig
+        payload = {
+            **snapshot,
+            "top_ips": top_ips,
+            "window_seconds": window_seconds,
+        }
+        enqueue_payload(payload)
 
 
 def start_watchers():
   for path in LOG_FILES:
     t = threading.Thread(target=watch_log_file, args=(path,), daemon=True)
     t.start()
+  reaper = threading.Thread(target=reaper_loop, daemon=True)
+  reaper.start()
 
 
 start_watchers()
@@ -250,51 +316,70 @@ start_watchers()
 
 @app.route("/")
 def index():
-  return render_template("index.html", window_seconds=window_seconds)
+  return render_template(
+      "index.html",
+      window_seconds=window_seconds,
+      active_ttl_seconds=active_ttl_seconds,
+  )
 
 
 @app.route("/api/config", methods=["GET", "POST"])
 def api_config():
-  global window_seconds
+  global window_seconds, active_ttl_seconds
   if request.method == "POST":
     data = request.get_json(silent=True) or {}
     try:
       new_window = int(data.get("window_seconds", window_seconds))
-      if 10 <= new_window <= 86400:
+      new_ttl = int(data.get("active_ttl_seconds", active_ttl_seconds))
+      if 10 <= new_window <= 86400 and 5 <= new_ttl <= 3600:
+        now = time.time()
         with state_lock:
           window_seconds = new_window
-          top_ips = build_top_ips(10)
-        payload = {
+          active_ttl_seconds = new_ttl
+          snapshot = build_active_snapshot(now=now)
+          top_ips = build_top_ips(10, now=now)
+        enqueue_payload({
+            **snapshot,
             "top_ips": top_ips,
             "window_seconds": window_seconds,
-        }
-        try:
-          event_queue.put_nowait(json.dumps(payload))
-        except queue.Full:
-          pass
-        return jsonify({"ok": True, "window_seconds": window_seconds})
+        })
+        return jsonify({
+            "ok": True,
+            "window_seconds": window_seconds,
+            "active_ttl_seconds": active_ttl_seconds,
+        })
     except (TypeError, ValueError):
       pass
-    return jsonify({"ok": False, "error": "Invalid window_seconds (10..86400)"}), 400
+    return jsonify({"ok": False, "error": "Invalid parameters"}), 400
 
   with state_lock:
-    prune_and_count_ips()
-  return jsonify({"window_seconds": window_seconds})
+    snapshot = build_active_snapshot()
+  return jsonify({
+      "window_seconds": window_seconds,
+      "active_ttl_seconds": active_ttl_seconds,
+      "active_connections": snapshot["active_connections"],
+  })
 
 
 @app.route("/stream")
 def stream():
   def event_stream():
+    with state_lock:
+      initial = {
+          **build_active_snapshot(),
+          "top_ips": build_top_ips(10),
+          "top_targets": build_top_targets(5),
+          "sources": dict(source_counts),
+          "window_seconds": window_seconds,
+      }
+    yield f"data: {json.dumps(initial)}\n\n"
+
     while True:
       try:
         msg = event_queue.get(timeout=15)
         yield f"data: {msg}\n\n"
       except queue.Empty:
-        # Periodically prune stale IPs so expired entries drop off even when traffic is quiet
-        with state_lock:
-          top_ips = build_top_ips(10)
-          current_window = window_seconds
-        yield f"data: {json.dumps({'top_ips': top_ips, 'window_seconds': current_window})}\n\n"
+        yield ": keep-alive\n\n"
 
   return Response(event_stream(), mimetype="text/event-stream")
 
