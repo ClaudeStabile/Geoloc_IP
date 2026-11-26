@@ -204,8 +204,20 @@
         const BASE_RADIUS = 6;
         const MAX_SCALE_RATIO = 4;
 
-        // One active marker per IP so expired IPs can be cleanly removed from the map
-        const activeMarkersByIp = new Map();
+        // Color endpoints for progressive fade before TTL expiration
+        const NGINX_BRIGHT_STROKE = [255, 77, 79];    // #ff4d4f (bright red)
+        const NGINX_LOW_STROKE    = [168, 85, 26];    // #a8551a (low orange)
+        const NGINX_BRIGHT_FILL   = [255, 120, 117];  // #ff7875
+        const NGINX_LOW_FILL      = [204, 112, 41];   // #cc7029
+
+        const HAPROXY_BRIGHT_STROKE = [47, 158, 68];  // #2f9e44 (bright green)
+        const HAPROXY_LOW_STROKE    = [74, 126, 199]; // #4a7ec7 (light low blue)
+        const HAPROXY_BRIGHT_FILL   = [81, 207, 102]; // #51cf66
+        const HAPROXY_LOW_FILL      = [130, 185, 247];// #82b9f7
+
+        // ip -> { layer, meta, lastSeenClient, ttlSeconds, ipCount }
+        const activeEntriesByIp = new Map();
+        let currentTtlSeconds = {{ active_ttl_seconds | default(60) }};
 
         function escapeHtml(str) {
             return String(str)
@@ -213,6 +225,43 @@
                 .replace(/</g, "&lt;")
                 .replace(/>/g, "&gt;")
                 .replace(/"/g, "&quot;");
+        }
+
+        function lerp(a, b, t) {
+            return a + (b - a) * t;
+        }
+
+        function lerpColor(rgbA, rgbB, t) {
+            const clamped = Math.max(0, Math.min(1, t));
+            const r = Math.round(lerp(rgbA[0], rgbB[0], clamped));
+            const g = Math.round(lerp(rgbA[1], rgbB[1], clamped));
+            const b = Math.round(lerp(rgbA[2], rgbB[2], clamped));
+            return `rgb(${r}, ${g}, ${b})`;
+        }
+
+        function getFadeStyle(source, progress) {
+            // progress: 0.0 = brand new, 1.0 = about to expire at TTL
+            const p = Math.max(0, Math.min(1, progress));
+            const isHaproxy = source === "haproxy";
+
+            const strokeColor = isHaproxy
+                ? lerpColor(HAPROXY_BRIGHT_STROKE, HAPROXY_LOW_STROKE, p)
+                : lerpColor(NGINX_BRIGHT_STROKE, NGINX_LOW_STROKE, p);
+
+            const fillColor = isHaproxy
+                ? lerpColor(HAPROXY_BRIGHT_FILL, HAPROXY_LOW_FILL, p)
+                : lerpColor(NGINX_BRIGHT_FILL, NGINX_LOW_FILL, p);
+
+            // Fade fill & border opacity smoothly as marker nears TTL end
+            const fillOpacity = lerp(0.85, 0.16, p);
+            const strokeOpacity = lerp(0.95, 0.28, p);
+
+            return {
+                color: strokeColor,
+                fillColor: fillColor,
+                fillOpacity: Number(fillOpacity.toFixed(3)),
+                opacity: Number(strokeOpacity.toFixed(3))
+            };
         }
 
         function formatWindowLabel(sec) {
@@ -240,53 +289,100 @@
             return BASE_RADIUS * ratio;
         }
 
+        function buildPopupHtml(data, ipCount) {
+            return (
+                `<b>Source:</b> ${escapeHtml((data.source || "nginx").toUpperCase())}<br>` +
+                `<b>IP:</b> ${escapeHtml(data.ip)} (${ipCount} active hits)<br>` +
+                `<b>Host:</b> ${escapeHtml(data.hostname)}<br>` +
+                `<b>Target:</b> ${escapeHtml(data.target || "—")}<br>` +
+                `<b>Location:</b> ${escapeHtml(data.city)}, ${escapeHtml(data.country)}`
+            );
+        }
+
+        function removeIpMarker(ip) {
+            const entry = activeEntriesByIp.get(ip);
+            if (entry) {
+                map.removeLayer(entry.layer);
+                activeEntriesByIp.delete(ip);
+            }
+        }
+
+        function updateMarkerFadeAndExpiry(nowMs) {
+            const toRemove = [];
+            for (const [ip, entry] of activeEntriesByIp.entries()) {
+                const ttlMs = (entry.ttlSeconds || currentTtlSeconds) * 1000;
+                const elapsedMs = Math.max(0, nowMs - entry.lastSeenClient);
+                const progress = elapsedMs / ttlMs;
+
+                if (progress >= 1) {
+                    toRemove.push(ip);
+                    continue;
+                }
+
+                const style = getFadeStyle(entry.meta.source, progress);
+                entry.layer.setStyle(style);
+            }
+
+            if (toRemove.length > 0) {
+                for (const ip of toRemove) {
+                    removeIpMarker(ip);
+                }
+                document.getElementById("count").innerText = activeEntriesByIp.size;
+            }
+        }
+
         function syncActiveMarkers(activeMarkers, expiredIps) {
             if (Array.isArray(expiredIps)) {
                 for (const ip of expiredIps) {
-                    const existing = activeMarkersByIp.get(ip);
-                    if (existing) {
-                        map.removeLayer(existing);
-                        activeMarkersByIp.delete(ip);
-                    }
+                    removeIpMarker(ip);
                 }
             }
 
             if (!Array.isArray(activeMarkers)) return;
 
             const currentIps = new Set(activeMarkers.map(m => m.ip));
-            for (const [ip, layer] of activeMarkersByIp.entries()) {
+            for (const ip of Array.from(activeEntriesByIp.keys())) {
                 if (!currentIps.has(ip)) {
-                    map.removeLayer(layer);
-                    activeMarkersByIp.delete(ip);
+                    removeIpMarker(ip);
                 }
             }
 
+            const nowMs = performance.now();
+
             for (const data of activeMarkers) {
-                const isHaproxy = data.source === "haproxy";
                 const ipCount = data.ip_count || 1;
                 const radius = computeRadius(ipCount);
-                const popupHtml =
-                    `<b>Source:</b> ${escapeHtml((data.source || "nginx").toUpperCase())}<br>` +
-                    `<b>IP:</b> ${escapeHtml(data.ip)} (${ipCount} active hits)<br>` +
-                    `<b>Host:</b> ${escapeHtml(data.hostname)}<br>` +
-                    `<b>Target:</b> ${escapeHtml(data.target || "—")}<br>` +
-                    `<b>Location:</b> ${escapeHtml(data.city)}, ${escapeHtml(data.country)}`;
+                const ttlSec = Number(data.ttl_seconds) || currentTtlSeconds;
+                const ageSec = Math.max(0, Number(data.age_seconds) || 0);
+                const lastSeenClient = nowMs - Math.min(ageSec, ttlSec) * 1000;
+                const progress = Math.min(1, ageSec / ttlSec);
+                const style = getFadeStyle(data.source, progress);
+                const popupHtml = buildPopupHtml(data, ipCount);
 
-                let marker = activeMarkersByIp.get(data.ip);
-                if (marker) {
-                    marker.setLatLng([data.lat, data.lon]);
-                    marker.setRadius(radius);
-                    marker.setPopupContent(popupHtml);
+                let entry = activeEntriesByIp.get(data.ip);
+                if (entry) {
+                    entry.meta = data;
+                    entry.ttlSeconds = ttlSec;
+                    entry.ipCount = ipCount;
+                    entry.lastSeenClient = lastSeenClient;
+                    entry.layer.setLatLng([data.lat, data.lon]);
+                    entry.layer.setRadius(radius);
+                    entry.layer.setStyle(style);
+                    entry.layer.setPopupContent(popupHtml);
                 } else {
-                    marker = L.circleMarker([data.lat, data.lon], {
+                    const layer = L.circleMarker([data.lat, data.lon], {
                         radius: radius,
-                        color: isHaproxy ? "#2f9e44" : "#ff4d4f",
                         weight: 2,
-                        fillColor: isHaproxy ? "#51cf66" : "#ff7875",
-                        fillOpacity: 0.8
+                        ...style
                     }).addTo(map);
-                    marker.bindPopup(popupHtml);
-                    activeMarkersByIp.set(data.ip, marker);
+                    layer.bindPopup(popupHtml);
+                    activeEntriesByIp.set(data.ip, {
+                        layer,
+                        meta: data,
+                        ttlSeconds: ttlSec,
+                        ipCount,
+                        lastSeenClient
+                    });
                 }
             }
         }
@@ -344,6 +440,7 @@
             });
             if (res.ok) {
                 const data = await res.json();
+                currentTtlSeconds = Number(data.active_ttl_seconds) || currentTtlSeconds;
                 ensureSelectValue("window-select", data.window_seconds);
                 ensureSelectValue("ttl-select", data.active_ttl_seconds);
                 document.getElementById("window-label").innerText = formatWindowLabel(data.window_seconds);
@@ -357,6 +454,11 @@
         document.getElementById("window-select").addEventListener("change", pushConfigUpdate);
         document.getElementById("ttl-select").addEventListener("change", pushConfigUpdate);
 
+        // Smoothly fade markers every 500ms as they approach TTL expiration
+        setInterval(() => {
+            updateMarkerFadeAndExpiry(performance.now());
+        }, 500);
+
         const evtSource = new EventSource("/stream");
         evtSource.onmessage = function(event) {
             const payload = JSON.parse(event.data);
@@ -365,6 +467,7 @@
                 document.getElementById("window-label").innerText = formatWindowLabel(payload.window_seconds);
             }
             if (payload.active_ttl_seconds) {
+                currentTtlSeconds = Number(payload.active_ttl_seconds);
                 ensureSelectValue("ttl-select", payload.active_ttl_seconds);
             }
             if (typeof payload.active_connections === "number") {

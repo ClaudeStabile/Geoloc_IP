@@ -22,7 +22,7 @@ GEOIP_DB_PATH = os.getenv("GEOIP_DB_PATH", "/data/GeoLite2-City.mmdb")
 # Rolling window for Top 10 IPs (default: 3600 = 1 hour)
 DEFAULT_WINDOW_SECONDS = max(10, int(os.getenv("WINDOW_SECONDS", "3600")))
 
-# Active connection TTL in seconds (default: 60s) — controls active count & live map markers
+# Active connection TTL in seconds (default: 60s) — controls active count, fade & live map markers
 DEFAULT_ACTIVE_TTL_SECONDS = max(5, int(os.getenv("ACTIVE_TTL_SECONDS", "60")))
 
 # Match IPv4 at start of Nginx line OR after "haproxy[pid]: " (with optional :port)
@@ -59,7 +59,7 @@ active_ttl_seconds = DEFAULT_ACTIVE_TTL_SECONDS
 
 ip_timestamps = {}  # ip -> deque of epoch timestamps for Top 10 window
 active_ip_timestamps = {}  # ip -> deque of epoch timestamps for active TTL
-ip_geo_meta = {}  # ip -> latest geo/source/target metadata while active
+ip_geo_meta = {}  # ip -> latest geo/source/target/last_seen metadata while active
 target_counts = Counter()
 source_counts = Counter()
 hostname_cache = {}
@@ -177,7 +177,7 @@ def build_top_targets(limit=5):
 
 
 def build_active_snapshot(now=None):
-  """Returns current active connections, active markers, and expired IPs."""
+  """Returns current active connections, active markers (with age/TTL), and expired IPs."""
   if now is None:
     now = time.time()
   active_counts, expired_ips = prune_deque_map(
@@ -191,9 +191,13 @@ def build_active_snapshot(now=None):
   for ip, hit_count in active_counts.items():
     total_active_hits += hit_count
     meta = ip_geo_meta.get(ip)
+    dq = active_ip_timestamps.get(ip)
+    latest_ts = dq[-1] if dq else now
     if meta:
       m = dict(meta)
       m["ip_count"] = hit_count
+      m["age_seconds"] = max(0.0, round(now - latest_ts, 2))
+      m["ttl_seconds"] = active_ttl_seconds
       markers.append(m)
 
   return {
@@ -202,6 +206,7 @@ def build_active_snapshot(now=None):
       "active_markers": markers,
       "expired_ips": expired_ips,
       "active_ttl_seconds": active_ttl_seconds,
+      "server_time": round(now, 2),
   }
 
 
@@ -262,6 +267,7 @@ def watch_log_file(filename):
 
       geo_data["source"] = source
       geo_data["target"] = target or "—"
+      geo_data["last_seen"] = now
       ip_geo_meta[ip] = dict(geo_data)
 
       snapshot = build_active_snapshot(now=now)
