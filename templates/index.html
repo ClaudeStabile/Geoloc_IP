@@ -1,55 +1,100 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="fr">
 <head>
     <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <meta name="theme-color" content="#14171a">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+    <meta name="apple-mobile-web-app-title" content="GeoTracker">
+    <link rel="manifest" href="/manifest.json">
     <title>Live IP Geolocation Tracker (Nginx + HAProxy)</title>
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="" />
     <style>
+        * {
+            box-sizing: border-box;
+        }
         html, body {
             height: 100%;
+            width: 100%;
             margin: 0;
             padding: 0;
-            font-family: system-ui, -apple-system, sans-serif;
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
             background-color: #14171a;
+            overflow: hidden;
         }
         #map {
             height: 100%;
             width: 100%;
+            z-index: 1;
+        }
+        .panel {
+            position: absolute;
+            background: rgba(20, 23, 26, 0.93);
+            backdrop-filter: blur(8px);
+            color: #f1f3f5;
+            box-shadow: 0 4px 16px rgba(0, 0, 0, 0.45);
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            border-radius: 10px;
+            z-index: 1000;
+            font-size: 13px;
         }
         #info-panel {
-            position: absolute;
-            top: 12px;
-            right: 12px;
+            top: calc(12px + env(safe-area-inset-top));
+            right: calc(12px + env(safe-area-inset-right));
             width: 365px;
-            max-height: calc(100% - 24px);
+            max-height: calc(100% - 24px - env(safe-area-inset-top) - env(safe-area-inset-bottom));
             overflow-y: auto;
-            background: rgba(20, 23, 26, 0.92);
-            color: #f1f3f5;
             padding: 14px 16px;
-            box-shadow: 0 4px 16px rgba(0, 0, 0, 0.45);
-            border: 1px solid rgba(255, 255, 255, 0.12);
-            border-radius: 8px;
-            z-index: 1000;
-            font-size: 13px;
         }
         #urls-panel {
-            position: absolute;
-            bottom: 12px;
-            left: 12px;
+            bottom: calc(12px + env(safe-area-inset-bottom));
+            left: calc(12px + env(safe-area-inset-left));
             width: 420px;
-            max-width: calc(100% - 24px);
-            background: rgba(20, 23, 26, 0.92);
-            color: #f1f3f5;
+            max-height: 42vh;
+            overflow-y: auto;
             padding: 12px 16px;
-            box-shadow: 0 4px 16px rgba(0, 0, 0, 0.45);
-            border: 1px solid rgba(255, 255, 255, 0.12);
-            border-radius: 8px;
-            z-index: 1000;
-            font-size: 13px;
+        }
+        .panel-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+        }
+        .toggle-btn {
+            display: none;
+            background: #2b3035;
+            color: #f1f3f5;
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            border-radius: 6px;
+            padding: 4px 9px;
+            font-size: 12px;
+            cursor: pointer;
+        }
+        .install-btn {
+            background: #2f9e44;
+            color: #ffffff;
+            border: none;
+            border-radius: 6px;
+            padding: 6px 10px;
+            font-size: 12px;
+            font-weight: 600;
+            cursor: pointer;
+            white-space: nowrap;
+        }
+        .install-btn:hover {
+            background: #37b24d;
+        }
+        .top-actions {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 8px;
+            margin-bottom: 10px;
+            flex-wrap: wrap;
         }
         .total-box {
             font-size: 15px;
-            margin-bottom: 8px;
         }
         .sources-bar {
             display: flex;
@@ -75,18 +120,21 @@
             background: #2b3035;
             color: #f1f3f5;
             border: 1px solid rgba(255, 255, 255, 0.2);
-            border-radius: 4px;
-            padding: 3px 6px;
+            border-radius: 6px;
+            padding: 5px 8px;
             font-size: 12px;
         }
         .dot-nginx { color: #ff7875; font-weight: 700; }
         .dot-haproxy { color: #51cf66; font-weight: 700; }
         h3 {
-            margin: 0 0 8px 0;
-            font-size: 13px;
+            margin: 0;
+            font-size: 12px;
             text-transform: uppercase;
             letter-spacing: 0.05em;
             color: #adb5bd;
+        }
+        .panel-body {
+            margin-top: 8px;
         }
         table {
             width: 100%;
@@ -131,63 +179,128 @@
             white-space: nowrap;
             padding-left: 8px;
         }
+        .ios-hint {
+            display: none;
+            font-size: 11px;
+            color: #a5d8ff;
+            background: rgba(116, 192, 252, 0.12);
+            border: 1px solid rgba(116, 192, 252, 0.25);
+            border-radius: 6px;
+            padding: 7px 9px;
+            margin-bottom: 10px;
+            line-height: 1.35;
+        }
+
+        /* Mobile layout */
+        @media (max-width: 768px) {
+            .toggle-btn {
+                display: inline-block;
+            }
+            #info-panel {
+                top: calc(10px + env(safe-area-inset-top));
+                left: calc(10px + env(safe-area-inset-left));
+                right: calc(10px + env(safe-area-inset-right));
+                width: auto;
+                max-height: 55vh;
+                padding: 10px 12px;
+            }
+            #info-panel.collapsed .collapsible {
+                display: none;
+            }
+            #urls-panel {
+                bottom: calc(10px + env(safe-area-inset-bottom));
+                left: calc(10px + env(safe-area-inset-left));
+                right: calc(10px + env(safe-area-inset-right));
+                width: auto;
+                max-height: 32vh;
+                padding: 10px 12px;
+            }
+            #urls-panel.collapsed .panel-body {
+                display: none;
+            }
+            .leaflet-control-zoom {
+                margin-bottom: 64px !important;
+            }
+        }
     </style>
 </head>
 <body>
-    <div id="info-panel">
-        <div class="total-box">
-            <b>Active connections:</b> <span id="count">0</span>
+    <div id="info-panel" class="panel">
+        <div class="top-actions">
+            <div class="total-box">
+                <b>Actives :</b> <span id="count">0</span>
+            </div>
+            <div style="display:flex; gap:6px; align-items:center;">
+                <button id="install-btn" class="install-btn" style="display:none;">Installer l'app</button>
+                <button id="toggle-info-btn" class="toggle-btn" type="button">Réduire</button>
+            </div>
         </div>
-        <div class="sources-bar">
-            <span><span class="dot-nginx">●</span> Nginx: <b id="src-nginx">0</b></span>
-            <span><span class="dot-haproxy">●</span> HAProxy: <b id="src-haproxy">0</b></span>
+
+        <div id="ios-hint" class="ios-hint">
+            Sur iPhone/iPad (Safari) : touchez <b>Partager</b> puis <b>Sur l'écran d'accueil</b> pour installer l'application.
         </div>
-        <div class="window-row">
-            <label for="ttl-select"><b>Active TTL:</b></label>
-            <select id="ttl-select">
-                <option value="15">15s</option>
-                <option value="30">30s</option>
-                <option value="60" selected>60s</option>
-                <option value="120">2m</option>
-                <option value="300">5m</option>
-            </select>
+
+        <div class="collapsible">
+            <div class="sources-bar">
+                <span><span class="dot-nginx">●</span> Nginx: <b id="src-nginx">0</b></span>
+                <span><span class="dot-haproxy">●</span> HAProxy: <b id="src-haproxy">0</b></span>
+            </div>
+            <div class="window-row">
+                <label for="ttl-select"><b>TTL actif :</b></label>
+                <select id="ttl-select">
+                    <option value="15">15s</option>
+                    <option value="30">30s</option>
+                    <option value="60" selected>60s</option>
+                    <option value="120">2m</option>
+                    <option value="300">5m</option>
+                </select>
+            </div>
+            <div class="window-row">
+                <label for="window-select"><b>Fenêtre Top 10 :</b></label>
+                <select id="window-select">
+                    <option value="900">15 min</option>
+                    <option value="3600" selected>1 heure</option>
+                    <option value="21600">6 heures</option>
+                    <option value="86400">24 heures</option>
+                </select>
+            </div>
+            <div class="panel-header">
+                <h3>Top 10 IP (<span id="window-label">1h</span>)</h3>
+            </div>
+            <div class="panel-body">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>IP / Hôte</th>
+                            <th style="text-align: right;">Hits</th>
+                        </tr>
+                    </thead>
+                    <tbody id="top-ips-body">
+                        <tr><td colspan="2" style="color:#868e96;">En attente de trafic...</td></tr>
+                    </tbody>
+                </table>
+            </div>
         </div>
-        <div class="window-row">
-            <label for="window-select"><b>Top 10 IP window:</b></label>
-            <select id="window-select">
-                <option value="900">15 minutes</option>
-                <option value="3600" selected>1 hour</option>
-                <option value="21600">6 hours</option>
-                <option value="86400">24 hours</option>
-            </select>
-        </div>
-        <h3>Top 10 IPs (<span id="window-label">1h</span>)</h3>
-        <table>
-            <thead>
-                <tr>
-                    <th>IP / Host</th>
-                    <th style="text-align: right;">Hits</th>
-                </tr>
-            </thead>
-            <tbody id="top-ips-body">
-                <tr><td colspan="2" style="color:#868e96;">Waiting for traffic...</td></tr>
-            </tbody>
-        </table>
     </div>
 
-    <div id="urls-panel">
-        <h3>Top 5 Active URLs / Backends</h3>
-        <table>
-            <thead>
-                <tr>
-                    <th>URL (Nginx) / Backend (HAProxy)</th>
-                    <th style="text-align: right;">Connections</th>
-                </tr>
-            </thead>
-            <tbody id="top-targets-body">
-                <tr><td colspan="2" style="color:#868e96;">Waiting for traffic...</td></tr>
-            </tbody>
-        </table>
+    <div id="urls-panel" class="panel">
+        <div class="panel-header">
+            <h3>Top 5 URL / Backends</h3>
+            <button id="toggle-urls-btn" class="toggle-btn" type="button">Afficher</button>
+        </div>
+        <div class="panel-body">
+            <table>
+                <thead>
+                    <tr>
+                        <th>URL (Nginx) / Backend (HAProxy)</th>
+                        <th style="text-align: right;">Hits</th>
+                    </tr>
+                </thead>
+                <tbody id="top-targets-body">
+                    <tr><td colspan="2" style="color:#868e96;">En attente de trafic...</td></tr>
+                </tbody>
+            </table>
+        </div>
     </div>
 
     <div id="map"></div>
@@ -198,24 +311,22 @@
 
         L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
             maxZoom: 19,
-            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
         }).addTo(map);
 
         const BASE_RADIUS = 6;
         const MAX_SCALE_RATIO = 4;
 
-        // Color endpoints for progressive fade before TTL expiration
-        const NGINX_BRIGHT_STROKE = [255, 77, 79];    // #ff4d4f (bright red)
-        const NGINX_LOW_STROKE    = [168, 85, 26];    // #a8551a (low orange)
-        const NGINX_BRIGHT_FILL   = [255, 120, 117];  // #ff7875
-        const NGINX_LOW_FILL      = [204, 112, 41];   // #cc7029
+        const NGINX_BRIGHT_STROKE = [255, 77, 79];
+        const NGINX_LOW_STROKE    = [168, 85, 26];
+        const NGINX_BRIGHT_FILL   = [255, 120, 117];
+        const NGINX_LOW_FILL      = [204, 112, 41];
 
-        const HAPROXY_BRIGHT_STROKE = [47, 158, 68];  // #2f9e44 (bright green)
-        const HAPROXY_LOW_STROKE    = [74, 126, 199]; // #4a7ec7 (light low blue)
-        const HAPROXY_BRIGHT_FILL   = [81, 207, 102]; // #51cf66
-        const HAPROXY_LOW_FILL      = [130, 185, 247];// #82b9f7
+        const HAPROXY_BRIGHT_STROKE = [47, 158, 68];
+        const HAPROXY_LOW_STROKE    = [74, 126, 199];
+        const HAPROXY_BRIGHT_FILL   = [81, 207, 102];
+        const HAPROXY_LOW_FILL      = [130, 185, 247];
 
-        // ip -> { layer, meta, lastSeenClient, ttlSeconds, ipCount }
         const activeEntriesByIp = new Map();
         let currentTtlSeconds = {{ active_ttl_seconds | default(60) }};
 
@@ -240,27 +351,20 @@
         }
 
         function getFadeStyle(source, progress) {
-            // progress: 0.0 = brand new, 1.0 = about to expire at TTL
             const p = Math.max(0, Math.min(1, progress));
             const isHaproxy = source === "haproxy";
-
             const strokeColor = isHaproxy
                 ? lerpColor(HAPROXY_BRIGHT_STROKE, HAPROXY_LOW_STROKE, p)
                 : lerpColor(NGINX_BRIGHT_STROKE, NGINX_LOW_STROKE, p);
-
             const fillColor = isHaproxy
                 ? lerpColor(HAPROXY_BRIGHT_FILL, HAPROXY_LOW_FILL, p)
                 : lerpColor(NGINX_BRIGHT_FILL, NGINX_LOW_FILL, p);
 
-            // Fade fill & border opacity smoothly as marker nears TTL end
-            const fillOpacity = lerp(0.85, 0.16, p);
-            const strokeOpacity = lerp(0.95, 0.28, p);
-
             return {
                 color: strokeColor,
                 fillColor: fillColor,
-                fillOpacity: Number(fillOpacity.toFixed(3)),
-                opacity: Number(strokeOpacity.toFixed(3))
+                fillOpacity: Number(lerp(0.85, 0.16, p).toFixed(3)),
+                opacity: Number(lerp(0.95, 0.28, p).toFixed(3))
             };
         }
 
@@ -291,11 +395,11 @@
 
         function buildPopupHtml(data, ipCount) {
             return (
-                `<b>Source:</b> ${escapeHtml((data.source || "nginx").toUpperCase())}<br>` +
-                `<b>IP:</b> ${escapeHtml(data.ip)} (${ipCount} active hits)<br>` +
-                `<b>Host:</b> ${escapeHtml(data.hostname)}<br>` +
-                `<b>Target:</b> ${escapeHtml(data.target || "—")}<br>` +
-                `<b>Location:</b> ${escapeHtml(data.city)}, ${escapeHtml(data.country)}`
+                `<b>Source :</b> ${escapeHtml((data.source || "nginx").toUpperCase())}<br>` +
+                `<b>IP :</b> ${escapeHtml(data.ip)} (${ipCount} hits actifs)<br>` +
+                `<b>Hôte :</b> ${escapeHtml(data.hostname)}<br>` +
+                `<b>Cible :</b> ${escapeHtml(data.target || "—")}<br>` +
+                `<b>Lieu :</b> ${escapeHtml(data.city)}, ${escapeHtml(data.country)}`
             );
         }
 
@@ -318,9 +422,7 @@
                     toRemove.push(ip);
                     continue;
                 }
-
-                const style = getFadeStyle(entry.meta.source, progress);
-                entry.layer.setStyle(style);
+                entry.layer.setStyle(getFadeStyle(entry.meta.source, progress));
             }
 
             if (toRemove.length > 0) {
@@ -337,7 +439,6 @@
                     removeIpMarker(ip);
                 }
             }
-
             if (!Array.isArray(activeMarkers)) return;
 
             const currentIps = new Set(activeMarkers.map(m => m.ip));
@@ -348,15 +449,13 @@
             }
 
             const nowMs = performance.now();
-
             for (const data of activeMarkers) {
                 const ipCount = data.ip_count || 1;
                 const radius = computeRadius(ipCount);
                 const ttlSec = Number(data.ttl_seconds) || currentTtlSeconds;
                 const ageSec = Math.max(0, Number(data.age_seconds) || 0);
                 const lastSeenClient = nowMs - Math.min(ageSec, ttlSec) * 1000;
-                const progress = Math.min(1, ageSec / ttlSec);
-                const style = getFadeStyle(data.source, progress);
+                const style = getFadeStyle(data.source, Math.min(1, ageSec / ttlSec));
                 const popupHtml = buildPopupHtml(data, ipCount);
 
                 let entry = activeEntriesByIp.get(data.ip);
@@ -390,10 +489,9 @@
         function renderTopIps(topIps) {
             const tbody = document.getElementById("top-ips-body");
             if (!topIps || topIps.length === 0) {
-                tbody.innerHTML = `<tr><td colspan="2" style="color:#868e96;">No active IPs in window</td></tr>`;
+                tbody.innerHTML = `<tr><td colspan="2" style="color:#868e96;">Aucune IP active</td></tr>`;
                 return;
             }
-
             tbody.innerHTML = topIps.map(item => `
                 <tr>
                     <td>
@@ -408,7 +506,6 @@
         function renderTopTargets(topTargets) {
             const tbody = document.getElementById("top-targets-body");
             if (!topTargets || topTargets.length === 0) return;
-
             tbody.innerHTML = topTargets.map(item => {
                 const isHaproxy = String(item.target).startsWith("[haproxy]");
                 const cellClass = isHaproxy ? "backend-cell" : "url-cell";
@@ -447,6 +544,67 @@
             }
         }
 
+        // Mobile panel collapse toggles
+        const infoPanel = document.getElementById("info-panel");
+        const urlsPanel = document.getElementById("urls-panel");
+        const toggleInfoBtn = document.getElementById("toggle-info-btn");
+        const toggleUrlsBtn = document.getElementById("toggle-urls-btn");
+
+        if (window.innerWidth <= 768) {
+            infoPanel.classList.add("collapsed");
+            urlsPanel.classList.add("collapsed");
+            toggleInfoBtn.innerText = "Infos";
+            toggleUrlsBtn.innerText = "Top 5";
+        }
+
+        toggleInfoBtn.addEventListener("click", () => {
+            const collapsed = infoPanel.classList.toggle("collapsed");
+            toggleInfoBtn.innerText = collapsed ? "Infos" : "Réduire";
+        });
+
+        toggleUrlsBtn.addEventListener("click", () => {
+            const collapsed = urlsPanel.classList.toggle("collapsed");
+            toggleUrlsBtn.innerText = collapsed ? "Top 5" : "Réduire";
+        });
+
+        // PWA Install prompt handling
+        let deferredPrompt = null;
+        const installBtn = document.getElementById("install-btn");
+        const iosHint = document.getElementById("ios-hint");
+        const isStandalone = window.matchMedia("(display-mode: standalone)").matches || window.navigator.standalone;
+        const isIos = /iphone|ipad|ipod/i.test(navigator.userAgent);
+
+        if (!isStandalone && isIos) {
+            iosHint.style.display = "block";
+        }
+
+        window.addEventListener("beforeinstallprompt", (e) => {
+            e.preventDefault();
+            deferredPrompt = e;
+            if (!isStandalone) {
+                installBtn.style.display = "inline-block";
+            }
+        });
+
+        installBtn.addEventListener("click", async () => {
+            if (!deferredPrompt) return;
+            deferredPrompt.prompt();
+            await deferredPrompt.userChoice;
+            deferredPrompt = null;
+            installBtn.style.display = "none";
+        });
+
+        window.addEventListener("appinstalled", () => {
+            installBtn.style.display = "none";
+            iosHint.style.display = "none";
+        });
+
+        if ("serviceWorker" in navigator) {
+            window.addEventListener("load", () => {
+                navigator.serviceWorker.register("/service-worker.js").catch(() => {});
+            });
+        }
+
         ensureSelectValue("window-select", {{ window_seconds | default(3600) }});
         ensureSelectValue("ttl-select", {{ active_ttl_seconds | default(60) }});
         document.getElementById("window-label").innerText = formatWindowLabel({{ window_seconds | default(3600) }});
@@ -454,7 +612,6 @@
         document.getElementById("window-select").addEventListener("change", pushConfigUpdate);
         document.getElementById("ttl-select").addEventListener("change", pushConfigUpdate);
 
-        // Smoothly fade markers every 500ms as they approach TTL expiration
         setInterval(() => {
             updateMarkerFadeAndExpiry(performance.now());
         }, 500);

@@ -6,7 +6,7 @@ import re
 import socket
 import threading
 import time
-from flask import Flask, Response, jsonify, render_template, request
+from flask import Flask, Response, jsonify, make_response, render_template, request
 import geoip2.database
 
 app = Flask(__name__)
@@ -22,7 +22,7 @@ GEOIP_DB_PATH = os.getenv("GEOIP_DB_PATH", "/data/GeoLite2-City.mmdb")
 # Rolling window for Top 10 IPs (default: 3600 = 1 hour)
 DEFAULT_WINDOW_SECONDS = max(10, int(os.getenv("WINDOW_SECONDS", "3600")))
 
-# Active connection TTL in seconds (default: 60s) — controls active count, fade & live map markers
+# Active connection TTL in seconds (default: 60s)
 DEFAULT_ACTIVE_TTL_SECONDS = max(5, int(os.getenv("ACTIVE_TTL_SECONDS", "60")))
 
 # Match IPv4 at start of Nginx line OR after "haproxy[pid]: " (with optional :port)
@@ -57,9 +57,9 @@ except Exception as e:
 window_seconds = DEFAULT_WINDOW_SECONDS
 active_ttl_seconds = DEFAULT_ACTIVE_TTL_SECONDS
 
-ip_timestamps = {}  # ip -> deque of epoch timestamps for Top 10 window
-active_ip_timestamps = {}  # ip -> deque of epoch timestamps for active TTL
-ip_geo_meta = {}  # ip -> latest geo/source/target/last_seen metadata while active
+ip_timestamps = {}
+active_ip_timestamps = {}
+ip_geo_meta = {}
 target_counts = Counter()
 source_counts = Counter()
 hostname_cache = {}
@@ -83,7 +83,6 @@ def extract_ip(line, source):
 
 
 def extract_target(line, source):
-  """Returns the requested URL for Nginx, or [haproxy] <backend/server> for HAProxy."""
   if source == "haproxy":
     match = HAPROXY_BACKEND_REGEX.search(line)
     if match:
@@ -132,7 +131,6 @@ def get_geoip(ip):
 
 
 def prune_deque_map(ts_map, max_age_seconds, now):
-  """Prunes timestamps older than now - max_age_seconds and returns active counts."""
   cutoff = now - max_age_seconds
   counts = {}
   expired_keys = []
@@ -177,7 +175,6 @@ def build_top_targets(limit=5):
 
 
 def build_active_snapshot(now=None):
-  """Returns current active connections, active markers (with age/TTL), and expired IPs."""
   if now is None:
     now = time.time()
   active_counts, expired_ips = prune_deque_map(
@@ -223,7 +220,6 @@ def enqueue_payload(payload_dict):
 
 
 def watch_log_file(filename):
-  """Continuously reads new lines from a single log file and pushes parsed events."""
   while not os.path.exists(filename):
     print(f"Attention: {filename} introuvable. En attente...")
     time.sleep(2)
@@ -285,7 +281,6 @@ def watch_log_file(filename):
 
 
 def reaper_loop():
-  """Periodically prunes expired active connections so counts drop and markers vanish."""
   last_signature = None
   while True:
     time.sleep(1)
@@ -327,6 +322,78 @@ def index():
       window_seconds=window_seconds,
       active_ttl_seconds=active_ttl_seconds,
   )
+
+
+@app.route("/manifest.json")
+def manifest():
+  svg_icon = (
+      "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 192 192'>"
+      "<rect width='192' height='192' rx='36' fill='#14171a'/>"
+      "<circle cx='96' cy='96' r='58' fill='none' stroke='#ff4d4f' stroke-width='10'/>"
+      "<circle cx='96' cy='96' r='24' fill='#51cf66'/>"
+      "</svg>"
+  )
+  icon_uri = "data:image/svg+xml," + svg_icon.replace("#", "%23")
+  data = {
+      "name": "Live IP Geo Tracker",
+      "short_name": "GeoTracker",
+      "description": "Surveillance temps réel des connexions Nginx & HAProxy",
+      "start_url": "/",
+      "scope": "/",
+      "display": "standalone",
+      "background_color": "#14171a",
+      "theme_color": "#14171a",
+      "icons": [
+          {
+              "src": icon_uri,
+              "sizes": "192x192 512x512",
+              "type": "image/svg+xml",
+              "purpose": "any maskable",
+          }
+      ],
+  }
+  resp = jsonify(data)
+  resp.headers["Content-Type"] = "application/manifest+json; charset=utf-8"
+  return resp
+
+
+@app.route("/service-worker.js")
+def service_worker():
+  js = """
+const CACHE_NAME = 'geotracker-v1';
+const STATIC_ASSETS = ['/', '/manifest.json'];
+
+self.addEventListener('install', (event) => {
+  event.waitUntil(
+    caches.open(CACHE_NAME).then((cache) => cache.addAll(STATIC_ASSETS)).then(() => self.skipWaiting())
+  );
+});
+
+self.addEventListener('activate', (event) => {
+  event.waitUntil(
+    caches.keys().then((keys) =>
+      Promise.all(keys.filter((k) => k !== CACHE_NAME).map((k) => caches.delete(k)))
+    ).then(() => self.clients.claim())
+  );
+});
+
+self.addEventListener('fetch', (event) => {
+  const url = new URL(event.request.url);
+  if (url.pathname === '/stream' || url.pathname.startsWith('/api/')) {
+    return;
+  }
+  if (event.request.method !== 'GET') {
+    return;
+  }
+  event.respondWith(
+    fetch(event.request).catch(() => caches.match(event.request))
+  );
+});
+"""
+  resp = make_response(js)
+  resp.headers["Content-Type"] = "application/javascript; charset=utf-8"
+  resp.headers["Service-Worker-Allowed"] = "/"
+  return resp
 
 
 @app.route("/api/config", methods=["GET", "POST"])
